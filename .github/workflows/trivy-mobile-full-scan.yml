@@ -20,59 +20,198 @@ jobs:
     name: trivy-full-scan
     runs-on: ubuntu-24.04
 
-    if: github.actor != 'dependabot[bot]' && !startsWith(github.head_ref, 'dependabot/')
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Prepare Gradle dependency information
+      - name: Set up Java 11 for Gradle 6.5
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "11"
+
+      - name: Show Java and Gradle versions
+        run: |
+          java -version
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            ./gradlew --version
+          fi
+
+      - name: Try to generate real Gradle lockfiles
         continue-on-error: true
         run: |
           if [ -f "./gradlew" ]; then
-            chmod +x ./gradlew
-            ./gradlew dependencies --write-locks || true
+            cat > trivy-gradle-locks.init.gradle <<'EOF'
+          allprojects {
+              dependencyLocking {
+                  lockAllConfigurations()
+              }
+          }
+          EOF
+
+            ./gradlew --no-daemon --init-script trivy-gradle-locks.init.gradle --write-locks dependencies
+          else
+            echo "No gradlew file found."
           fi
 
-      - name: Run Trivy table report
-        uses: aquasecurity/trivy-action@v0.36.0
+      - name: Generate fallback Gradle lockfile from declared dependencies
+        run: |
+          python3 <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          root = Path(".")
+          variables = {}
+
+          assignment_patterns = [
+              re.compile(r"ext\.([A-Za-z0-9_]+)\s*=\s*['\"]([^'\"]+)['\"]"),
+              re.compile(r"versions\.([A-Za-z0-9_]+)\s*=\s*['\"]([^'\"]+)['\"]"),
+          ]
+
+          for path in root.rglob("*.gradle"):
+              text = path.read_text(errors="ignore")
+              for pattern in assignment_patterns:
+                  for key, value in pattern.findall(text):
+                      variables[key] = value
+
+          dependency_pattern = re.compile(
+              r"""
+              (?P<conf>
+                  implementation|
+                  api|
+                  compile|
+                  compileOnly|
+                  runtimeOnly|
+                  classpath|
+                  kapt|
+                  annotationProcessor|
+                  testImplementation|
+                  androidTestImplementation|
+                  debugImplementation|
+                  releaseImplementation|
+                  kaptTest
+              )
+              \s*
+              \(?
+              \s*
+              ['"]
+              (?P<dep>[^'"]+)
+              ['"]
+              """,
+              re.VERBOSE,
+          )
+
+          dependencies = set()
+
+          def resolve_variables(value: str) -> str:
+              value = re.sub(
+                  r"\$\{versions\.([A-Za-z0-9_]+)\}",
+                  lambda m: variables.get(m.group(1), m.group(0)),
+                  value,
+              )
+              value = re.sub(
+                  r"\$([A-Za-z0-9_]+)",
+                  lambda m: variables.get(m.group(1), m.group(0)),
+                  value,
+              )
+              return value
+
+          for path in root.rglob("*.gradle"):
+              text = path.read_text(errors="ignore")
+              for match in dependency_pattern.finditer(text):
+                  dep = resolve_variables(match.group("dep")).strip()
+
+                  if dep.startswith("project"):
+                      continue
+
+                  parts = dep.split(":")
+                  if len(parts) != 3:
+                      continue
+
+                  group_id, artifact_id, version = parts
+
+                  if "$" in version or "{" in version or "}" in version:
+                      continue
+
+                  if not group_id or not artifact_id or not version:
+                      continue
+
+                  dependencies.add(f"{group_id}:{artifact_id}:{version}=runtimeClasspath")
+
+          output = Path("trivy-fallback-gradle.lockfile")
+          with output.open("w", encoding="utf-8") as f:
+              f.write("# Synthetic Gradle lockfile generated for Trivy fallback scanning\n")
+              f.write("# This file is for security scanning only\n")
+              for item in sorted(dependencies):
+                  f.write(item + "\n")
+
+          print(f"Generated {output} with {len(dependencies)} direct dependencies")
+          print(output.read_text())
+          PY
+
+      - name: Show dependency evidence for Trivy
+        run: |
+          echo "Files that Trivy may use:"
+          find . -name "gradle.lockfile" -print | sort
+          find . -name "*gradle.lockfile" -print | sort
+          find . -name "pom.xml" -print | sort
+          find . -name "*.jar" -print | sort
+          find . -name "*.aar" -print | sort
+          find . -name "package-lock.json" -print | sort
+          find . -name "yarn.lock" -print | sort
+          find . -name "Podfile.lock" -print | sort
+          find . -name "AndroidManifest.xml" -print | sort
+
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@v0.2.6
         with:
-          scan-type: fs
-          scan-ref: .
-          format: table
-          scanners: vuln,secret,misconfig,license
-          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
-          ignore-unfixed: false
-          timeout: 20m
-          exit-code: 0
+          version: v0.70.0
+
+      - name: Run Trivy table report
+        continue-on-error: true
+        run: |
+          trivy fs . \
+            --scanners vuln,secret,misconfig,license \
+            --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
+            --include-dev-deps \
+            --include-non-failures \
+            --detection-priority comprehensive \
+            --table-mode summary,detailed \
+            --format table \
+            --exit-code 0 \
+            --timeout 20m
 
       - name: Run Trivy JSON report
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          scan-type: fs
-          scan-ref: .
-          format: json
-          output: trivy-results.json
-          scanners: vuln,secret,misconfig,license
-          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
-          ignore-unfixed: false
-          timeout: 20m
-          exit-code: 0
+        continue-on-error: true
+        run: |
+          trivy fs . \
+            --scanners vuln,secret,misconfig,license \
+            --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
+            --include-dev-deps \
+            --include-non-failures \
+            --detection-priority comprehensive \
+            --list-all-pkgs \
+            --format json \
+            --output trivy-results.json \
+            --exit-code 0 \
+            --timeout 20m
 
       - name: Run Trivy SARIF report
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          scan-type: fs
-          scan-ref: .
-          format: sarif
-          output: trivy-results.sarif
-          scanners: vuln,secret,misconfig,license
-          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
-          ignore-unfixed: false
-          timeout: 20m
-          exit-code: 0
+        continue-on-error: true
+        run: |
+          trivy fs . \
+            --scanners vuln,secret,misconfig,license \
+            --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
+            --include-dev-deps \
+            --detection-priority comprehensive \
+            --format sarif \
+            --output trivy-results.sarif \
+            --exit-code 0 \
+            --timeout 20m
 
       - name: Upload Trivy SARIF to GitHub Security
         if: always()
@@ -88,14 +227,5 @@ jobs:
           path: |
             trivy-results.json
             trivy-results.sarif
+            trivy-fallback-gradle.lockfile
           retention-days: 30
-
-  noop:
-    name: trivy-full-scan
-    runs-on: ubuntu-24.04
-
-    if: github.actor == 'dependabot[bot]' || startsWith(github.head_ref, 'dependabot/')
-
-    steps:
-      - name: Skip Trivy for Dependabot
-        run: echo "Trivy scan skipped for Dependabot."
