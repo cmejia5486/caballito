@@ -35,16 +35,13 @@ jobs:
       - name: Show Java and Gradle versions
         run: |
           java -version
-          if [ -f "./gradlew" ]; then
-            chmod +x ./gradlew
-            ./gradlew --version
-          fi
+          chmod +x ./gradlew
+          ./gradlew --version
 
       - name: Try to generate real Gradle lockfiles
         continue-on-error: true
         run: |
-          if [ -f "./gradlew" ]; then
-            cat > trivy-gradle-locks.init.gradle <<'EOF'
+          cat > trivy-gradle-locks.init.gradle <<'EOF'
           allprojects {
               dependencyLocking {
                   lockAllConfigurations()
@@ -52,15 +49,13 @@ jobs:
           }
           EOF
 
-            ./gradlew --no-daemon --init-script trivy-gradle-locks.init.gradle --write-locks dependencies
-          else
-            echo "No gradlew file found."
-          fi
+          ./gradlew --no-daemon --init-script trivy-gradle-locks.init.gradle --write-locks \
+            :openmrs-client:dependencies \
+            :openmrs-android-sdk:dependencies
 
       - name: Generate fallback Gradle lockfile from declared dependencies
         run: |
           python3 <<'PY'
-          import os
           import re
           from pathlib import Path
 
@@ -72,8 +67,16 @@ jobs:
               re.compile(r"versions\.([A-Za-z0-9_]+)\s*=\s*['\"]([^'\"]+)['\"]"),
           ]
 
+          gradle_files = []
           for path in root.rglob("*.gradle"):
-              text = path.read_text(errors="ignore")
+              if not path.is_file():
+                  continue
+              if ".gradle" in path.parts:
+                  continue
+              gradle_files.append(path)
+
+          for path in gradle_files:
+              text = path.read_text(encoding="utf-8", errors="ignore")
               for pattern in assignment_patterns:
                   for key, value in pattern.findall(text):
                       variables[key] = value
@@ -120,8 +123,8 @@ jobs:
               )
               return value
 
-          for path in root.rglob("*.gradle"):
-              text = path.read_text(errors="ignore")
+          for path in gradle_files:
+              text = path.read_text(encoding="utf-8", errors="ignore")
               for match in dependency_pattern.finditer(text):
                   dep = resolve_variables(match.group("dep")).strip()
 
@@ -134,10 +137,7 @@ jobs:
 
                   group_id, artifact_id, version = parts
 
-                  if "$" in version or "{" in version or "}" in version:
-                      continue
-
-                  if not group_id or not artifact_id or not version:
+                  if "$" in version or "{" in version or "}" in version or "+" in version:
                       continue
 
                   dependencies.add(f"{group_id}:{artifact_id}:{version}=runtimeClasspath")
@@ -156,15 +156,17 @@ jobs:
       - name: Show dependency evidence for Trivy
         run: |
           echo "Files that Trivy may use:"
-          find . -name "gradle.lockfile" -print | sort
-          find . -name "*gradle.lockfile" -print | sort
-          find . -name "pom.xml" -print | sort
-          find . -name "*.jar" -print | sort
-          find . -name "*.aar" -print | sort
-          find . -name "package-lock.json" -print | sort
-          find . -name "yarn.lock" -print | sort
-          find . -name "Podfile.lock" -print | sort
-          find . -name "AndroidManifest.xml" -print | sort
+          find . -type f \( \
+            -name "gradle.lockfile" \
+            -o -name "*gradle.lockfile" \
+            -o -name "pom.xml" \
+            -o -name "package-lock.json" \
+            -o -name "yarn.lock" \
+            -o -name "Podfile.lock" \
+            -o -name "*.jar" \
+            -o -name "*.aar" \
+            -o -name "AndroidManifest.xml" \
+          \) -print | sort
 
       - name: Install Trivy
         uses: aquasecurity/setup-trivy@v0.2.6
@@ -214,7 +216,7 @@ jobs:
             --timeout 20m
 
       - name: Upload Trivy SARIF to GitHub Security
-        if: always()
+        if: always() && hashFiles('trivy-results.sarif') != ''
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-results.sarif
@@ -228,4 +230,5 @@ jobs:
             trivy-results.json
             trivy-results.sarif
             trivy-fallback-gradle.lockfile
+          if-no-files-found: warn
           retention-days: 30
