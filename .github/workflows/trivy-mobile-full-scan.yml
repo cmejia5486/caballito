@@ -1,0 +1,101 @@
+name: Mobile Full Trivy Scan
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+  schedule:
+    - cron: "0 10 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  trivy-full-scan:
+    name: trivy-full-scan
+    runs-on: ubuntu-24.04
+
+    if: github.actor != 'dependabot[bot]' && !startsWith(github.head_ref, 'dependabot/')
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare Gradle dependency information
+        continue-on-error: true
+        run: |
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            ./gradlew dependencies --write-locks || true
+          fi
+
+      - name: Run Trivy table report
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table
+          scanners: vuln,secret,misconfig,license
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          ignore-unfixed: false
+          timeout: 20m
+          exit-code: 0
+
+      - name: Run Trivy JSON report
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: json
+          output: trivy-results.json
+          scanners: vuln,secret,misconfig,license
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          ignore-unfixed: false
+          timeout: 20m
+          exit-code: 0
+
+      - name: Run Trivy SARIF report
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-results.sarif
+          scanners: vuln,secret,misconfig,license
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          ignore-unfixed: false
+          timeout: 20m
+          exit-code: 0
+
+      - name: Upload Trivy SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Upload Trivy reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-full-security-reports
+          path: |
+            trivy-results.json
+            trivy-results.sarif
+          retention-days: 30
+
+  noop:
+    name: trivy-full-scan
+    runs-on: ubuntu-24.04
+
+    if: github.actor == 'dependabot[bot]' || startsWith(github.head_ref, 'dependabot/')
+
+    steps:
+      - name: Skip Trivy for Dependabot
+        run: echo "Trivy scan skipped for Dependabot."
