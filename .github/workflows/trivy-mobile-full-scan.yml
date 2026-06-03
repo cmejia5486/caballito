@@ -169,7 +169,7 @@ jobs:
           \) -print | sort
 
       - name: Install Trivy
-        uses: aquasecurity/setup-trivy@v0.2.6
+        uses: aquasecurity/setup-trivy@v0.3.1
         with:
           version: v0.70.0
 
